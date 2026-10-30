@@ -1,0 +1,83 @@
+name: async-payments-ttask
+
+x-app: &app
+  build: .
+  env_file: .env
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Set RABBITMQ_DEFAULT_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Set RABBITMQ_DEFAULT_PASS in .env}
+    ports: ["${API_BIND_HOST:?}:${RABBITMQ_MANAGEMENT_PORT:?}:15672"]
+    volumes: [rabbitmq_data:/var/lib/rabbitmq]
+    healthcheck:
+      test: [CMD, rabbitmq-diagnostics, -q, ping]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: [alembic, upgrade, head]
+    depends_on:
+      postgres: {condition: service_healthy}
+
+  api:
+    <<: *app
+    ports: ["${API_BIND_HOST:?}:${API_PORT:?}:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, python, -c, "import os,urllib.request; urllib.request.urlopen(urllib.request.Request('http://localhost:8000/health',headers={'X-API-Key':os.environ['API_KEY']}),timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
+  consumer:
+    <<: *app
+    command: [faststream, run, app.consumer:app]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      rabbitmq: {condition: service_healthy}
+    restart: unless-stopped
+
+  webhook:
+    <<: *app
+    profiles: [demo]
+    command: [uvicorn, examples.webhook:app, --host, 0.0.0.0, --port, "8080"]
+    volumes: ["./examples:/service/examples:ro"]
+    ports: ["${API_BIND_HOST:?}:${WEBHOOK_PORT:?}:8080"]
+
+  tests:
+    <<: *app
+    profiles: [test]
+    user: root
+    command: [sh, -c, "pip install -e '.[dev]' && pytest -q"]
+    volumes:
+      - ./tests:/service/tests:ro
+      - ./.env.example:/service/.env.example:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

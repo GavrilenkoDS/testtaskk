@@ -1,0 +1,73 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install development dependencies
+        run: python -m pip install -e '.[dev]'
+
+      - name: Configure the demo environment
+        run: cp .env.example .env
+
+      - name: Lint and formatting
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Validate Compose and start services
+        run: |
+          docker compose config --quiet
+          docker compose --profile demo up -d --build
+
+      - name: Unit and integration tests
+        run: docker compose --profile test run --rm --build tests
+
+      - name: End-to-end scenarios
+        run: python -m scripts.e2e
+
+      - name: Include E2E results in the job summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path('reports/e2e-results.json')
+          if report.exists():
+              data = json.loads(report.read_text(encoding='utf-8'))
+              with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+                  summary.write(f"E2E: {data['passed']}/{data['total']} passed\n\n")
+                  for case in data['cases']:
+                      summary.write(f"- {case['case']}: {case['status']}\n")
+          PY
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose --profile demo logs --no-color --tail=100
+
+      - name: Stop services
+        if: always()
+        run: docker compose --profile demo --profile test down

@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from app.config import SmokeSettings
+from app.constants import DEAD_LETTER_QUEUE, MAX_ATTEMPTS
 
 settings = SmokeSettings()
 API = settings.smoke_api_url.rstrip("/")
@@ -68,7 +69,7 @@ def main():
         payments[path] = created["payment_id"]
 
     delivered = wait_for(payments["webhook"], lambda p: p["webhook_sent_at"] is not None)
-    exhausted = wait_for(payments["fail"], lambda p: p["attempts_completed"] == 3)
+    exhausted = wait_for(payments["fail"], lambda p: p["attempts_completed"] == MAX_ATTEMPTS)
     assert delivered["status"] in ("succeeded", "failed")
     assert delivered["attempts_completed"] == 1
     assert exhausted["status"] in ("succeeded", "failed")
@@ -85,7 +86,7 @@ def main():
     while time.monotonic() < deadline:
         _, messages = request(
             "POST",
-            f"{RABBIT}/api/queues/%2F/payments.dlq/get",
+            f"{RABBIT}/api/queues/%2F/{DEAD_LETTER_QUEUE}/get",
             {
                 "count": 100,
                 "ackmode": "ack_requeue_true",

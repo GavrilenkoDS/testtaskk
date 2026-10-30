@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
+from app.constants import DEAD_LETTER_ROUTING_KEY, MAX_ATTEMPTS, PAYMENTS_ROUTING_KEY
 from app.models import Outbox, Payment
 from app.schemas import PaymentEvent
 
@@ -41,11 +42,11 @@ def record_failure(
 ) -> None:
     payment.last_error = error
     payment.attempts_completed = event.attempt
-    if event.attempt < 3:
+    if event.attempt < MAX_ATTEMPTS:
         delay = get_settings().retry_base_seconds * 2 ** (event.attempt - 1)
         session.add(
             Outbox(
-                routing_key="payments.new",
+                routing_key=PAYMENTS_ROUTING_KEY,
                 payload={"payment_id": str(payment.id), "attempt": event.attempt + 1},
                 available_at=datetime.now(UTC) + timedelta(seconds=delay),
             )
@@ -56,7 +57,7 @@ def record_failure(
             payment.processed_at = datetime.now(UTC)
         session.add(
             Outbox(
-                routing_key="payments.dead",
+                routing_key=DEAD_LETTER_ROUTING_KEY,
                 payload={
                     **event.model_dump(mode="json"),
                     "error": error,

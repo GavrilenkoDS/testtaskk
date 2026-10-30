@@ -1,8 +1,11 @@
 import asyncio
 import logging
+from collections.abc import AsyncGenerator
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Annotated
 
 import httpx
-from faststream import FastStream
+from faststream import Context, ContextRepo, FastStream
 from faststream.exceptions import RejectMessage
 from pydantic import ValidationError
 
@@ -15,14 +18,38 @@ from app.schemas import PaymentEvent
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 broker = make_broker()
-app = FastStream(broker)
-client: httpx.AsyncClient
-relay_task: asyncio.Task | None = None
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def lifespan(context: ContextRepo) -> AsyncGenerator[None, None]:
+    async with AsyncExitStack() as stack:
+        stack.push_async_callback(engine.dispose)
+        client = await stack.enter_async_context(
+            httpx.AsyncClient(
+                timeout=get_settings().webhook_timeout_seconds,
+                follow_redirects=False,
+                trust_env=False,
+            )
+        )
+        stack.enter_context(context.scope("http_client", client))
+        await stack.enter_async_context(broker)
+        await declare_topology(broker)
+        relay_task = asyncio.create_task(relay(sessions, broker))
+        try:
+            yield
+        finally:
+            relay_task.cancel()
+            await asyncio.gather(relay_task, return_exceptions=True)
+
+
+app = FastStream(broker, lifespan=lifespan)
+
+
 @broker.subscriber(QUEUE, EXCHANGE, retry=True, decoder=lambda message: message.body)
-async def handle_payment(message: bytes) -> None:
+async def handle_payment(
+    message: bytes, client: Annotated[httpx.AsyncClient, Context("http_client")]
+) -> None:
     try:
         event = PaymentEvent.model_validate_json(message)
     except ValidationError as exc:
@@ -42,35 +69,3 @@ async def handle_payment(message: bytes) -> None:
             # Avoid a hot requeue loop during a database outage.
             await asyncio.sleep(get_settings().database_requeue_delay_seconds)
             raise
-
-
-@app.on_startup
-async def prepare() -> None:
-    global client
-    await broker.connect()
-    await declare_topology(broker)
-    client = httpx.AsyncClient(
-        timeout=get_settings().webhook_timeout_seconds,
-        follow_redirects=False,
-        trust_env=False,
-    )
-
-
-@app.after_startup
-async def startup() -> None:
-    global relay_task
-    relay_task = asyncio.create_task(relay(sessions, broker))
-
-
-@app.on_shutdown
-async def shutdown() -> None:
-    if relay_task:
-        relay_task.cancel()
-        await asyncio.gather(relay_task, return_exceptions=True)
-
-
-@app.after_shutdown
-async def cleanup() -> None:
-    if "client" in globals():
-        await client.aclose()
-    await engine.dispose()

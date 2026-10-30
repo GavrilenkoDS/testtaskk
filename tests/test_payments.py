@@ -254,6 +254,97 @@ async def test_valid_unicode_round_trips(api_client, body):
     assert detail["metadata"] == body["metadata"]
 
 
+@pytest.mark.parametrize("token", ["1e1000", "-1e1000", "NaN"])
+@pytest.mark.parametrize("location", ["amount", "metadata", "nested_array"])
+async def test_nonfinite_numbers_return_422_without_writes(
+    api_client, body, factory, token, location
+):
+    changes = {
+        "amount": {"amount": "NUMBER_TOKEN"},
+        "metadata": {"metadata": {"value": "NUMBER_TOKEN"}},
+        "nested_array": {"metadata": {"items": [{"value": "NUMBER_TOKEN"}]}},
+    }
+    content = json.dumps({**body, **changes[location]}).replace('"NUMBER_TOKEN"', token)
+    response = await api_client.post(
+        "/api/v1/payments",
+        content=content.encode(),
+        headers={"Idempotency-Key": "nonfinite-number", "Content-Type": "application/json"},
+    )
+    assert response.status_code == 422, response.text
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "amount" if location == "amount" else "metadata"]
+    assert set(error) == {"loc", "msg", "type"}
+    async with factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Payment)) == 0
+        assert await session.scalar(select(func.count()).select_from(Outbox)) == 0
+
+
+@pytest.mark.parametrize("container", [dict, list])
+async def test_deep_metadata_returns_compact_422_without_writes(
+    api_client, body, factory, container
+):
+    nested = "value"
+    for _ in range(299):
+        nested = {"child": nested} if container is dict else [nested]
+    response = await api_client.post(
+        "/api/v1/payments",
+        json={**body, "metadata": {"child": nested}},
+        headers={"Idempotency-Key": "deep-metadata"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"][0]["loc"] == ["body", "metadata"]
+    assert len(response.content) < 1000
+    async with factory() as session:
+        assert await session.scalar(select(func.count()).select_from(Payment)) == 0
+        assert await session.scalar(select(func.count()).select_from(Outbox)) == 0
+
+
+@pytest.mark.parametrize(("depth", "expected"), [(32, 202), (33, 422)])
+async def test_metadata_depth_boundary(api_client, body, depth, expected):
+    metadata = {"value": 1.25}
+    for _ in range(depth - 1):
+        metadata = {"child": metadata}
+    response = await api_client.post(
+        "/api/v1/payments",
+        json={**body, "metadata": metadata},
+        headers={"Idempotency-Key": "metadata-boundary"},
+    )
+    assert response.status_code == expected, response.text
+    if expected == 202:
+        detail = await api_client.get(f"/api/v1/payments/{response.json()['payment_id']}")
+        assert detail.json()["metadata"] == metadata
+
+
+async def test_cancellation_after_gateway_commit_resumes_webhook(api_client, body, factory):
+    event = await create(api_client, body)
+    gateway = AsyncMock(return_value="succeeded")
+
+    def interrupted(request):
+        raise asyncio.CancelledError()
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(interrupted)) as client:
+        with pytest.raises(asyncio.CancelledError):
+            await process_payment(event, factory, client, gateway)
+    async with factory() as session:
+        payment = await session.get(Payment, event.payment_id)
+        assert payment.status == "succeeded"
+        assert payment.attempts_completed == 0
+        assert payment.webhook_sent_at is None
+        processed_at = payment.processed_at
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200))
+    ) as client:
+        await process_payment(event, factory, client, gateway)
+    gateway.assert_awaited_once()
+    async with factory() as session:
+        payment = await session.get(Payment, event.payment_id)
+        assert payment.status == "succeeded"
+        assert payment.processed_at == processed_at
+        assert payment.webhook_sent_at is not None
+        assert payment.attempts_completed == 1
+
+
 async def test_webhook_total_deadline_retries_then_dlq(api_client, body, factory, monkeypatch):
     event = await create(api_client, body)
     gateway = AsyncMock(return_value="succeeded")

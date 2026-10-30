@@ -11,6 +11,14 @@ from urllib.error import HTTPError, URLError
 from uuid import uuid4
 
 from app.config import get_settings
+from app.constants import (
+    DEAD_LETTER_QUEUE,
+    DEAD_LETTER_ROUTING_KEY,
+    MAX_ATTEMPTS,
+    PAYMENTS_EXCHANGE,
+    PAYMENTS_QUEUE,
+    PAYMENTS_ROUTING_KEY,
+)
 from scripts.smoke import API, KEY, RABBIT, WEBHOOK, request, settings, wait_for
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -117,10 +125,10 @@ def publish(body):
     encoded = json.dumps(body) if isinstance(body, dict) else body
     result = rabbit(
         "POST",
-        "exchanges/%2F/payments/publish",
+        f"exchanges/%2F/{PAYMENTS_EXCHANGE}/publish",
         {
             "properties": {"content_type": "application/json", "delivery_mode": 2},
-            "routing_key": "payments.new",
+            "routing_key": PAYMENTS_ROUTING_KEY,
             "payload": encoded,
             "payload_encoding": "string",
         },
@@ -131,7 +139,7 @@ def publish(body):
 def dlq_contains(predicate):
     messages = rabbit(
         "POST",
-        "queues/%2F/payments.dlq/get",
+        f"queues/%2F/{DEAD_LETTER_QUEUE}/get",
         {
             "count": 1000,
             "ackmode": "ack_requeue_true",
@@ -201,15 +209,15 @@ def concurrent_idempotency_case():
 
 def retry_dlq_case():
     payment_id = create(payload("fail"))
-    payment = wait_for(payment_id, lambda p: p["attempts_completed"] == 3)
+    payment = wait_for(payment_id, lambda p: p["attempts_completed"] == MAX_ATTEMPTS)
     assert payment["webhook_sent_at"] is None
     eventually(lambda: dlq_contains(lambda raw: payment_id in raw))
     rows = outbox_rows(payment_id)
     retries = sorted(
-        (row for row in rows if row["routing_key"] == "payments.new"),
+        (row for row in rows if row["routing_key"] == PAYMENTS_ROUTING_KEY),
         key=lambda row: row["payload"]["attempt"],
     )
-    assert [row["payload"]["attempt"] for row in retries] == [1, 2, 3]
+    assert [row["payload"]["attempt"] for row in retries] == list(range(1, MAX_ATTEMPTS + 1))
     delays = []
     for row in retries[1:]:
         delay = (
@@ -221,10 +229,10 @@ def retry_dlq_case():
             row["available_at"]
         )
         delays.append(round(delay, 3))
-    assert len([row for row in rows if row["routing_key"] == "payments.dead"]) == 1
+    assert len([row for row in rows if row["routing_key"] == DEAD_LETTER_ROUTING_KEY]) == 1
     return {
         "payment_id": payment_id,
-        "attempts": 3,
+        "attempts": MAX_ATTEMPTS,
         "retry_delay_seconds": delays,
         "dlq": True,
         "payment_status": payment["status"],
@@ -272,11 +280,11 @@ def webhook_recovery_case():
         payment_id = create()
         before = wait_for(payment_id, lambda p: p["attempts_completed"] >= 1)
         assert before["webhook_sent_at"] is None
-        assert before["attempts_completed"] < 3
+        assert before["attempts_completed"] < MAX_ATTEMPTS
     finally:
         docker("start", "webhook")
     after = wait_for(payment_id, lambda p: p["webhook_sent_at"] is not None)
-    assert after["attempts_completed"] in (2, 3)
+    assert 1 < after["attempts_completed"] <= MAX_ATTEMPTS
     assert after["processed_at"] == before["processed_at"]
     assert after["status"] == before["status"]
     assert after["last_error"] is None
@@ -291,11 +299,11 @@ def duplicate_event_case():
     payment_id = create()
     before = wait_for(payment_id, lambda p: p["webhook_sent_at"] is not None)
     log_count = docker("logs", "--no-color", "webhook").count("POST /webhook")
-    queue = rabbit("GET", "queues/%2F/payments.new")
+    queue = rabbit("GET", f"queues/%2F/{PAYMENTS_QUEUE}")
     ack_before = queue.get("message_stats", {}).get("ack", 0)
     publish({"payment_id": payment_id, "attempt": 1})
     eventually(
-        lambda: rabbit("GET", "queues/%2F/payments.new").get("message_stats", {}).get("ack", 0)
+        lambda: rabbit("GET", f"queues/%2F/{PAYMENTS_QUEUE}").get("message_stats", {}).get("ack", 0)
         > ack_before,
         timeout=20,
     )

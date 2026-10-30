@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config import get_settings
+from app.constants import DEAD_LETTER_ROUTING_KEY
 from app.messaging import DLX, EXCHANGE
 from app.models import Outbox
 
@@ -27,7 +28,7 @@ async def publish_one(factory: async_sessionmaker[AsyncSession], broker: RabbitB
 
         await broker.publish(
             event.payload,
-            exchange=DLX if event.routing_key == "payments.dead" else EXCHANGE,
+            exchange=DLX if event.routing_key == DEAD_LETTER_ROUTING_KEY else EXCHANGE,
             routing_key=event.routing_key,
             persist=True,
             mandatory=True,

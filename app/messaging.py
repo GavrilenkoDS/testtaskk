@@ -1,19 +1,27 @@
 from faststream.rabbit import RabbitBroker, RabbitExchange, RabbitQueue
 
 from app.config import get_settings
+from app.constants import (
+    DEAD_LETTER_EXCHANGE,
+    DEAD_LETTER_QUEUE,
+    DEAD_LETTER_ROUTING_KEY,
+    PAYMENTS_EXCHANGE,
+    PAYMENTS_QUEUE,
+    PAYMENTS_ROUTING_KEY,
+)
 
-EXCHANGE = RabbitExchange("payments", durable=True)
-DLX = RabbitExchange("payments.dlx", durable=True)
+EXCHANGE = RabbitExchange(PAYMENTS_EXCHANGE, durable=True)
+DLX = RabbitExchange(DEAD_LETTER_EXCHANGE, durable=True)
 QUEUE = RabbitQueue(
-    "payments.new",
+    PAYMENTS_QUEUE,
     durable=True,
-    routing_key="payments.new",
+    routing_key=PAYMENTS_ROUTING_KEY,
     arguments={
-        "x-dead-letter-exchange": "payments.dlx",
-        "x-dead-letter-routing-key": "payments.dead",
+        "x-dead-letter-exchange": DEAD_LETTER_EXCHANGE,
+        "x-dead-letter-routing-key": DEAD_LETTER_ROUTING_KEY,
     },
 )
-DLQ = RabbitQueue("payments.dlq", durable=True, routing_key="payments.dead")
+DLQ = RabbitQueue(DEAD_LETTER_QUEUE, durable=True, routing_key=DEAD_LETTER_ROUTING_KEY)
 
 
 def make_broker() -> RabbitBroker:
@@ -30,5 +38,5 @@ async def declare_topology(broker: RabbitBroker) -> None:
     dlx = await broker.declare_exchange(DLX)
     queue = await broker.declare_queue(QUEUE)
     dlq = await broker.declare_queue(DLQ)
-    await queue.bind(exchange, routing_key="payments.new")
-    await dlq.bind(dlx, routing_key="payments.dead")
+    await queue.bind(exchange, routing_key=PAYMENTS_ROUTING_KEY)
+    await dlq.bind(dlx, routing_key=DEAD_LETTER_ROUTING_KEY)

@@ -17,6 +17,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from app.constants import MAX_ATTEMPTS
+
 
 class Base(DeclarativeBase):
     pass
@@ -28,7 +30,9 @@ class Payment(Base):
         CheckConstraint("amount > 0", name="ck_payments_amount"),
         CheckConstraint("currency IN ('RUB','USD','EUR')", name="ck_payments_currency"),
         CheckConstraint("status IN ('pending','succeeded','failed')", name="ck_payments_status"),
-        CheckConstraint("attempts_completed BETWEEN 0 AND 3", name="ck_payments_attempts"),
+        CheckConstraint(
+            f"attempts_completed BETWEEN 0 AND {MAX_ATTEMPTS}", name="ck_payments_attempts"
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
